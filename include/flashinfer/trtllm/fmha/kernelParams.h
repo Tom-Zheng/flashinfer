@@ -206,6 +206,12 @@ struct KernelParams {
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx{true};
+  // Context-phase block sparse attention: number of KV blocks per Q tile [B, numHeadsKv, numQTiles].
+  int32_t const* ptrFullBlockCnt{nullptr};
+  // Context-phase block sparse attention: KV block indices [B, numHeadsKv, numQTiles, maxKvBlocksPerQTile].
+  int32_t const* ptrFullBlockIdx{nullptr};
+  // Maximum number of KV blocks per Q tile (last dim of ptrFullBlockIdx).
+  int32_t mMaxKvBlocksPerQTile{0};
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
@@ -829,8 +835,11 @@ struct KernelParams {
     FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
                      "SparseMlaTopK must be a multiple of 4");
     params.mSparseMlaTopK = options.mSparseMlaTopK;
-    // TODO: Integrate trtllm block-sparse attention kernels when needed.
-    params.mUseBlockSparseAttention = false;
+    // Context-phase block sparse attention (FA4-style).
+    params.mUseBlockSparseAttention = options.mUsesCtxBlockSparse;
+    params.ptrFullBlockCnt = options.fullBlockCntPtr;
+    params.ptrFullBlockIdx = options.fullBlockIdxPtr;
+    params.mMaxKvBlocksPerQTile = options.mMaxKvBlocksPerQTile;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
     params.mUsesSharedPagedKvIdx = options.mUsesSharedPagedKvIdx;
     return params;

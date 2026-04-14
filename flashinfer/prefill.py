@@ -3710,6 +3710,192 @@ def trtllm_ragged_attention_deepseek(
 
 
 @flashinfer_api
+def trtllm_block_sparse_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    batch_size: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    full_block_cnt: torch.Tensor,
+    full_block_idx: torch.Tensor,
+    max_kv_blocks_per_q_tile: int,
+    enable_pdl: Optional[bool] = None,
+    return_lse: bool = False,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """FA4-style block sparse attention using trtllm-gen Blackwell kernels.
+
+    For each Q-tile, only the KV blocks listed in full_block_idx are computed.
+    KV blocks not in the list are fully masked (skipped).
+
+    The block sparse kernels use SeparateQkv layout with Dense mask type.
+    The sparsity itself acts as the attention mask.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Query tensor with shape [num_tokens, num_heads, head_dim].
+    key : torch.Tensor
+        Key tensor with shape [num_tokens, num_kv_heads, head_dim].
+    value : torch.Tensor
+        Value tensor with shape [num_tokens, num_kv_heads, head_dim].
+    workspace_buffer : torch.Tensor
+        Workspace buffer (must be zero-initialized on first use).
+    seq_lens : torch.Tensor
+        KV sequence lengths [batch_size], int32.
+    max_q_len : int
+        Maximum query sequence length in the batch.
+    max_kv_len : int
+        Maximum KV sequence length in the batch.
+    bmm1_scale : Union[float, torch.Tensor]
+        Scale for Q*K matmul (typically 1/sqrt(head_dim) * scale_q * scale_k).
+    bmm2_scale : Union[float, torch.Tensor]
+        Scale for P*V matmul (typically scale_v).
+    batch_size : int
+        Batch size.
+    cum_seq_lens_q : torch.Tensor
+        Cumulative query sequence lengths [batch_size + 1], int32.
+    cum_seq_lens_kv : torch.Tensor
+        Cumulative KV sequence lengths [batch_size + 1], int32.
+    full_block_cnt : torch.Tensor
+        Number of active KV blocks per Q-tile [batch_size, num_kv_heads, num_q_tiles], int32.
+    full_block_idx : torch.Tensor
+        KV block indices [batch_size, num_kv_heads, num_q_tiles, max_kv_blocks_per_q_tile], int32.
+    max_kv_blocks_per_q_tile : int
+        Maximum number of KV blocks per Q tile (last dim of full_block_idx).
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch. Auto-detected if None.
+    return_lse : bool
+        Whether to return log-sum-exp values.
+    skip_softmax_threshold_scale_factor : Optional[float]
+        Threshold for skip-softmax sparsity. None for standard attention.
+    out : Optional[torch.Tensor]
+        Output tensor. Allocated if not provided.
+    lse : Optional[torch.Tensor]
+        LSE tensor. Allocated if not provided and return_lse is True.
+
+    Returns
+    -------
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Output tensor, or (output, lse) if return_lse is True.
+
+    Notes
+    -----
+    Block sizes are fixed at tile_size_q=128, tile_size_kv=128.
+    num_q_tiles = ceil(max_q_len / step_q) where step_q depends on head_dim:
+      - head_dim 64/128: step_q = 256 (tileSizeQ=128, numInstsQ=2)
+      - head_dim 256: step_q = 128 (tileSizeQ=128, numInstsQ=1)
+
+    Supported dtypes: fp16, bf16, fp8 (e4m3).
+    Supported head_dims: 64, 128, 256.
+    Requires Blackwell GPU (SM100+).
+    """
+    # Validate inputs.
+    assert query.ndim == 3, f"query must be 3D, got {query.ndim}D"
+    assert key.ndim == 3, f"key must be 3D, got {key.ndim}D"
+    assert value.ndim == 3, f"value must be 3D, got {value.ndim}D"
+    assert full_block_cnt.dtype == torch.int32, (
+        f"full_block_cnt must be int32, got {full_block_cnt.dtype}"
+    )
+    assert full_block_idx.dtype == torch.int32, (
+        f"full_block_idx must be int32, got {full_block_idx.dtype}"
+    )
+    assert full_block_cnt.ndim == 3, (
+        f"full_block_cnt must be 3D [B, H, numQTiles], got {full_block_cnt.ndim}D"
+    )
+    assert full_block_idx.ndim == 4, (
+        f"full_block_idx must be 4D [B, H, numQTiles, maxKvBlocksPerQTile], got {full_block_idx.ndim}D"
+    )
+    assert full_block_cnt.shape[0] == batch_size, (
+        f"full_block_cnt batch dim mismatch: {full_block_cnt.shape[0]} vs {batch_size}"
+    )
+    assert full_block_idx.shape[0] == batch_size, (
+        f"full_block_idx batch dim mismatch: {full_block_idx.shape[0]} vs {batch_size}"
+    )
+    assert full_block_idx.shape[-1] == max_kv_blocks_per_q_tile, (
+        f"full_block_idx last dim must be {max_kv_blocks_per_q_tile}, got {full_block_idx.shape[-1]}"
+    )
+    head_dim = query.shape[2]
+    assert head_dim in (64, 128, 256), (
+        f"head_dim must be 64, 128, or 256, got {head_dim}"
+    )
+
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_block_sparse_attention
+    sm_count = get_device_sm_count(query.device)
+
+    if out is None:
+        # FP8 kernels output BF16
+        out_dtype = torch.bfloat16 if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else query.dtype
+        out = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            value.shape[2],
+            device=query.device,
+            dtype=out_dtype,
+        )
+
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
+
+    o_sf_scale = 0.0
+
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+    run_func(
+        out,
+        query,
+        key,
+        value,
+        workspace_buffer,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale,
+        batch_size,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        sm_count,
+        enable_pdl,
+        workspace_size,
+        full_block_cnt,
+        full_block_idx,
+        max_kv_blocks_per_q_tile,
+        skip_softmax_threshold_scale_factor,
+        lse,
+    )
+
+    if return_lse:
+        assert lse is not None
+        return out, lse
+    else:
+        return out
+
+
+@flashinfer_api
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],

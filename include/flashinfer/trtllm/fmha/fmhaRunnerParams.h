@@ -303,6 +303,14 @@ struct TllmGenFmhaRunnerParams {
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx;
+  // Whether to use context-phase block sparse attention (FA4-style).
+  bool mUsesCtxBlockSparse;
+  // Context-phase block sparse: full_block_cnt[B, numHeadsKv, numQTiles].
+  int32_t const* fullBlockCntPtr;
+  // Context-phase block sparse: full_block_idx[B, numHeadsKv, numQTiles, maxKvBlocksPerQTile].
+  int32_t const* fullBlockIdxPtr;
+  // Maximum number of KV blocks per Q tile (last dim of fullBlockIdxPtr).
+  int32_t mMaxKvBlocksPerQTile;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).

@@ -1,4 +1,5 @@
 import math
+import random
 from typing import Union
 
 import pytest
@@ -1802,4 +1803,267 @@ def test_trtllm_batch_decode_spec(
         max_q_len=max_q_len,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+# ============================================================
+# Block Sparse Attention Tests
+# ============================================================
+
+
+def block_sparse_attention_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    full_block_cnt: torch.Tensor,
+    full_block_idx: torch.Tensor,
+    batch_size: int,
+    num_kv_heads: int,
+    num_qo_heads: int,
+    head_dim: int,
+    tile_size_q: int,
+    tile_size_kv: int,
+    scale: float,
+) -> torch.Tensor:
+    """Reference implementation of block sparse attention using PyTorch.
+
+    Computes attention for each batch element by applying the block sparse mask:
+    only KV blocks listed in full_block_idx are attended to.
+    """
+    q_f32 = q.float()
+    k_f32 = k.float()
+    v_f32 = v.float()
+    head_grp_size = num_qo_heads // num_kv_heads
+    out = torch.zeros_like(q_f32)
+
+    for b in range(batch_size):
+        q_start = cum_seq_lens_q[b].item()
+        q_end = cum_seq_lens_q[b + 1].item()
+        kv_start = cum_seq_lens_kv[b].item()
+        kv_end = cum_seq_lens_kv[b + 1].item()
+        seq_len_q = q_end - q_start
+        seq_len_kv = kv_end - kv_start
+
+        q_b = q_f32[q_start:q_end]  # [seq_len_q, num_qo_heads, head_dim]
+        k_b = k_f32[kv_start:kv_end]  # [seq_len_kv, num_kv_heads, head_dim]
+        v_b = v_f32[kv_start:kv_end]  # [seq_len_kv, num_kv_heads, head_dim]
+
+        num_q_tiles = math.ceil(seq_len_q / tile_size_q)
+        num_kv_tiles = math.ceil(seq_len_kv / tile_size_kv)
+
+        for h_kv in range(num_kv_heads):
+            for h_offset in range(head_grp_size):
+                h_q = h_kv * head_grp_size + h_offset
+                for q_tile_idx in range(num_q_tiles):
+                    q_tile_start = q_tile_idx * tile_size_q
+                    q_tile_end = min(q_tile_start + tile_size_q, seq_len_q)
+
+                    q_tile = q_b[q_tile_start:q_tile_end, h_q, :]  # [tile_q, D]
+
+                    # Gather KV blocks according to block sparse indices.
+                    cnt = full_block_cnt[b, h_kv, q_tile_idx].item()
+                    if cnt == 0:
+                        continue
+
+                    kv_tokens = []
+                    for s in range(cnt):
+                        kv_block_idx = full_block_idx[b, h_kv, q_tile_idx, s].item()
+                        kv_tile_start = kv_block_idx * tile_size_kv
+                        kv_tile_end = min(kv_tile_start + tile_size_kv, seq_len_kv)
+                        kv_tokens.append((kv_tile_start, kv_tile_end))
+
+                    # Concatenate selected KV blocks.
+                    k_selected = torch.cat(
+                        [k_b[s:e, h_kv, :] for s, e in kv_tokens], dim=0
+                    )
+                    v_selected = torch.cat(
+                        [v_b[s:e, h_kv, :] for s, e in kv_tokens], dim=0
+                    )
+
+                    # Compute attention.
+                    scores = torch.matmul(q_tile, k_selected.T) * scale
+                    attn_weights = torch.softmax(scores, dim=-1)
+                    attn_out = torch.matmul(attn_weights, v_selected)
+
+                    out[q_start + q_tile_start : q_start + q_tile_end, h_q, :] = (
+                        attn_out
+                    )
+
+    return out.to(q.dtype)
+
+
+def _test_trtllm_block_sparse_attention(
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    head_dim: int,
+    dtype_str: str,
+    density: float,
+    device: str = GPU_DEVICE,
+):
+    """Test block sparse attention against a reference implementation."""
+    compute_capability = get_compute_capability(torch.device(device=device))
+    if compute_capability[0] != 10:
+        pytest.skip("Block sparse trtllm-gen kernels require SM100/SM103 GPUs.")
+
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
+    dtype = dtype_map[dtype_str]
+
+    torch.manual_seed(42)
+    random.seed(42)
+
+    num_qo_heads = num_kv_heads * head_grp_size
+
+    # Block sparse kernels have step_q that depends on head_dim:
+    # head_dim 64/128 -> step_q = 256, head_dim 256 -> step_q = 128
+    step_q = 256 if head_dim <= 128 else 128
+    tile_size_kv = 128
+
+    num_q_tiles = math.ceil(seq_len_q / step_q)
+    num_kv_tiles = math.ceil(seq_len_kv / tile_size_kv)
+
+    # Generate random Q, K, V (ragged format: all sequences concatenated).
+    # For simplicity, use fixed seq lengths per batch element.
+    actual_seq_lens_q = torch.full((batch_size,), seq_len_q, dtype=torch.int32, device=device)
+    actual_seq_lens_kv = torch.full((batch_size,), seq_len_kv, dtype=torch.int32, device=device)
+    cum_seq_lens_q = torch.cat(
+        [torch.tensor([0], device=device), torch.cumsum(actual_seq_lens_q, dim=0)]
+    ).int()
+    cum_seq_lens_kv = torch.cat(
+        [torch.tensor([0], device=device), torch.cumsum(actual_seq_lens_kv, dim=0)]
+    ).int()
+    total_q = cum_seq_lens_q[-1].item()
+    total_kv = cum_seq_lens_kv[-1].item()
+
+    # Create input tensors.
+    if dtype_str == "fp8":
+        q = torch.randn(total_q, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+        q_fp8 = q.to(torch.float8_e4m3fn)
+        k_fp8 = k.to(torch.float8_e4m3fn)
+        v_fp8 = v.to(torch.float8_e4m3fn)
+    else:
+        q = torch.randn(total_q, num_qo_heads, head_dim, device=device, dtype=dtype)
+        k = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=dtype)
+
+    # Generate block sparse masks.
+    num_active_blocks = max(1, int(num_kv_tiles * density))
+    full_block_cnt = torch.full(
+        (batch_size, num_kv_heads, num_q_tiles), num_active_blocks, dtype=torch.int32, device=device
+    )
+    full_block_idx = torch.zeros(
+        (batch_size, num_kv_heads, num_q_tiles, num_kv_tiles),
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # For each (b, h, q_tile), randomly select blocks.
+    for b in range(batch_size):
+        for h in range(num_kv_heads):
+            for qt in range(num_q_tiles):
+                all_blocks = list(range(num_kv_tiles))
+                random.shuffle(all_blocks)
+                selected = sorted(all_blocks[:num_active_blocks])
+                for i, block_id in enumerate(selected):
+                    full_block_idx[b, h, qt, i] = block_id
+
+    max_kv_blocks_per_q_tile = num_kv_tiles
+    scale = 1.0 / math.sqrt(head_dim)
+
+    workspace_buffer, _ = create_workspace_buffers(device)
+
+    # Compute reference.
+    if dtype_str == "fp8":
+        ref_out = block_sparse_attention_reference(
+            q_fp8, k_fp8, v_fp8,
+            cum_seq_lens_q, cum_seq_lens_kv,
+            full_block_cnt, full_block_idx,
+            batch_size, num_kv_heads, num_qo_heads, head_dim,
+            step_q, tile_size_kv, scale,
+        )
+    else:
+        ref_out = block_sparse_attention_reference(
+            q, k, v,
+            cum_seq_lens_q, cum_seq_lens_kv,
+            full_block_cnt, full_block_idx,
+            batch_size, num_kv_heads, num_qo_heads, head_dim,
+            step_q, tile_size_kv, scale,
+        )
+
+    # Call trtllm block sparse attention.
+    bmm1_scale = scale
+    bmm2_scale = 1.0
+    if dtype_str == "fp8":
+        actual_out = flashinfer.prefill.trtllm_block_sparse_attention(
+            q_fp8, k_fp8, v_fp8,
+            workspace_buffer,
+            actual_seq_lens_kv,
+            seq_len_q, seq_len_kv,
+            bmm1_scale, bmm2_scale,
+            batch_size,
+            cum_seq_lens_q, cum_seq_lens_kv,
+            full_block_cnt, full_block_idx,
+            max_kv_blocks_per_q_tile,
+        )
+    else:
+        actual_out = flashinfer.prefill.trtllm_block_sparse_attention(
+            q, k, v,
+            workspace_buffer,
+            actual_seq_lens_kv,
+            seq_len_q, seq_len_kv,
+            bmm1_scale, bmm2_scale,
+            batch_size,
+            cum_seq_lens_q, cum_seq_lens_kv,
+            full_block_cnt, full_block_idx,
+            max_kv_blocks_per_q_tile,
+        )
+
+    # Compare. FP8 has lower precision: e4m3 has ~0.125 error at magnitude 1.
+    atol = 0.15 if dtype_str == "fp8" else 1e-2
+    rtol = 0.15 if dtype_str == "fp8" else 1e-2
+    torch.testing.assert_close(
+        actual_out.float(),
+        ref_out.float(),
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,seq_len_q,seq_len_kv,num_kv_heads,head_grp_size,head_dim,dtype_str,density",
+    [
+        # BF16 tests
+        (2, 512, 512, 4, 4, 128, "bf16", 0.5),
+        (1, 1024, 1024, 2, 8, 64, "bf16", 0.25),
+        (2, 256, 512, 4, 4, 128, "bf16", 0.5),
+        # FP16 tests
+        (2, 512, 512, 4, 4, 128, "fp16", 0.5),
+        (1, 1024, 1024, 2, 8, 64, "fp16", 0.25),
+        # FP8 tests
+        (2, 512, 512, 4, 4, 128, "fp8", 0.5),
+        (1, 1024, 1024, 2, 8, 64, "fp8", 0.25),
+        # Head dim 256 tests
+        (1, 256, 256, 2, 4, 256, "bf16", 0.5),
+        (1, 256, 256, 2, 4, 256, "fp16", 0.5),
+    ],
+)
+def test_trtllm_block_sparse_attention(
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    head_dim: int,
+    dtype_str: str,
+    density: float,
+):
+    _test_trtllm_block_sparse_attention(
+        batch_size, seq_len_q, seq_len_kv, num_kv_heads, head_grp_size,
+        head_dim, dtype_str, density,
     )

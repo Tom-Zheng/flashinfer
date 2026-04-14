@@ -634,6 +634,149 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size, stream);
 }
 
+void trtllm_block_sparse_attention(
+    TensorView out, TensorView query, TensorView key, TensorView value,
+    TensorView workspace_buffer, TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
+    double o_sf_scale, int64_t batch_size, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv,
+    int64_t sm_count, bool enable_pdl, int64_t workspace_size, TensorView full_block_cnt,
+    TensorView full_block_idx, int64_t max_kv_blocks_per_q_tile,
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<TensorView> lse) {
+  TVM_FFI_ICHECK_EQ(out.ndim(), 3) << "out must be a 3D tensor";
+  TVM_FFI_ICHECK_EQ(query.ndim(), 3) << "query must be a 3D tensor";
+  TVM_FFI_ICHECK_EQ(key.ndim(), 3) << "key must be a 3D tensor";
+  TVM_FFI_ICHECK_EQ(value.ndim(), 3) << "value must be a 3D tensor";
+
+  auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
+  auto kv_data_type = dl_dtype_to_tllm_data_type(key.dtype());
+  auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
+  const auto stream = get_stream(query.device());
+  int num_qo_heads = query.size(1);
+  int num_kv_heads = key.size(1);
+  int sum_seq_q = query.size(0);
+  int sum_seq_kv = key.size(0);
+  int head_dim_qk = query.size(2);
+  int head_dim_v = value.size(2);
+  int k_stride_keys_values = key.stride(0);
+  int k_stride_heads = key.stride(1);
+  int k_stride_batch = key.numel();
+  int v_stride_keys_values = value.stride(0);
+  int v_stride_heads = value.stride(1);
+  int v_stride_batch = value.numel();
+
+  float* lse_ptr = nullptr;
+  if (lse.has_value()) {
+    TVM_FFI_ICHECK_EQ(lse.value().dtype(), dl_float32) << "lse must be a float tensor";
+    lse_ptr = static_cast<float*>(lse.value().data_ptr());
+  }
+
+  auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
+  auto maybe_bmm2_scale_value = bmm2_scale.as<double>();
+  auto maybe_bmm1_scale_log2_tensor = bmm1_scale.as<ffi::Tensor>();
+  auto maybe_bmm2_scale_tensor = bmm2_scale.as<ffi::Tensor>();
+  TVM_FFI_CHECK(maybe_bmm1_scale_value.has_value() || maybe_bmm1_scale_log2_tensor.has_value(),
+                "bmm1_scale must be either a double or a tensor");
+  TVM_FFI_CHECK(maybe_bmm2_scale_value.has_value() || maybe_bmm2_scale_tensor.has_value(),
+                "bmm2_scale must be either a double or a tensor");
+  double bmm1_scale_value =
+      maybe_bmm1_scale_value.has_value() ? maybe_bmm1_scale_value.value() : 1.0;
+  double bmm2_scale_value =
+      maybe_bmm2_scale_value.has_value() ? maybe_bmm2_scale_value.value() : 1.0;
+  float* bmm1_scale_log2_ptr =
+      maybe_bmm1_scale_log2_tensor.has_value()
+          ? static_cast<float*>(maybe_bmm1_scale_log2_tensor.value().data_ptr())
+          : nullptr;
+  float* bmm2_scale_ptr = maybe_bmm2_scale_tensor.has_value()
+                              ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
+                              : nullptr;
+
+  float const skip_softmax_threshold_scale_factor_value =
+      skip_softmax_threshold_scale_factor.value_or(0.0f);
+  bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
+
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
+            << " and num_qo_heads: " << num_qo_heads;
+    FLASHINFER_ERROR(err_msg.str());
+  }
+  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
+  TllmGenFmhaRunnerParams runner_params;
+
+  runner_params.qPtr = query.data_ptr();
+  runner_params.kPtr = key.data_ptr();
+  runner_params.vPtr = value.data_ptr();
+  runner_params.kvPageIdxPtr = nullptr;
+  runner_params.seqLensKvPtr = static_cast<int*>(seq_lens.data_ptr());
+  runner_params.oPtr = out.data_ptr();
+  runner_params.mHeadDimQk = head_dim_qk;
+  runner_params.mHeadDimV = head_dim_v;
+  runner_params.mNumHeadsQ = num_qo_heads;
+  runner_params.mNumHeadsKv = num_kv_heads;
+  runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
+  runner_params.mBatchSize = batch_size;
+  runner_params.mMaxSeqLenKv = max_kv_len;
+  runner_params.mQkvLayout = QkvLayout::SeparateQkv;
+  runner_params.mMultiProcessorCount = sm_count;
+  runner_params.stream = stream;
+  runner_params.outputScale = bmm2_scale_value;
+  runner_params.outputScalePtr = bmm2_scale_ptr;
+  runner_params.scaleSoftmaxLog2 = bmm1_scale_value * M_LOG2E;
+  runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
+  runner_params.mScaleSfO = o_sf_scale;
+  runner_params.mChunkedAttentionSize = INT_MAX;
+  runner_params.mAttentionWindowSize = INT_MAX;
+  runner_params.mMaxSeqLenQ = max_q_len;
+  runner_params.mSumOfSeqLensQ = sum_seq_q;
+  runner_params.mSumOfSeqLensKv = sum_seq_kv;
+  runner_params.cumSeqLensKvPtr = static_cast<int*>(cum_seq_lens_kv.data_ptr());
+  runner_params.cumSeqLensQPtr = static_cast<int*>(cum_seq_lens_q.data_ptr());
+  runner_params.enable_pdl = enable_pdl;
+  runner_params.lsePtr = lse_ptr;
+
+  runner_params.kStrideKeysValues = k_stride_keys_values;
+  runner_params.kStrideHeads = k_stride_heads;
+  runner_params.kStrideBatch = k_stride_batch;
+  runner_params.vStrideKeysValues = v_stride_keys_values;
+  runner_params.vStrideHeads = v_stride_heads;
+  runner_params.vStrideBatch = v_stride_batch;
+
+  // Block sparse: use Dense mask (sparsity IS the mask) and Context kernel type.
+  runner_params.mKernelType = FmhaKernelType::Context;
+  runner_params.mTileScheduler = TileScheduler::Persistent;
+  runner_params.mMaskType = TrtllmGenAttentionMaskType::Dense;
+
+  // Block sparse parameters.
+  runner_params.mUsesCtxBlockSparse = true;
+  runner_params.fullBlockCntPtr = static_cast<int32_t*>(full_block_cnt.data_ptr());
+  runner_params.fullBlockIdxPtr = static_cast<int32_t*>(full_block_idx.data_ptr());
+  runner_params.mMaxKvBlocksPerQTile = max_kv_blocks_per_q_tile;
+
+  AlignedAllocator float_allocator(workspace_buffer.data_ptr(), workspace_size);
+  size_t max_batch_size = 8192;
+  size_t max_num_qo_heads = 256;
+  size_t num_semaphores = round_up(max_batch_size * max_num_qo_heads, 8);
+  runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
+      num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
+  runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
+      sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ, 16,
+      "trtllm_gen_softmax_workspace");
+  runner_params.multiCtasKvScratchPtr =
+      float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
+
+  runner_params.mSkipsSoftmaxWhenPossible = skips_softmax;
+  runner_params.mSkipSoftmaxThresholdScaleFactor = skip_softmax_threshold_scale_factor_value;
+
+  auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
+  if (!foundKernels) {
+    std::ostringstream err_msg;
+    err_msg << "Missing TRTLLM-GEN kernel block sparse attention: " << kinfo;
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
+  fmha_runner->run(runner_params);
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -641,5 +784,6 @@ namespace trtllm_cubin_loader {
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention, trtllm_ragged_attention);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_block_sparse_attention, trtllm_block_sparse_attention);
 
 }  // namespace flashinfer
