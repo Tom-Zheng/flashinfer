@@ -28,6 +28,9 @@ required.
 Public API:
 - ``gated_delta_rule()``: T=1 single-token decode with BF16 state.
 - ``gated_delta_rule_mtp()``: multi-token prediction (T>=1) with BF16 state.
+  In frozen-state spec verify, ``cache_replayssm=True`` replaces full intermediate
+  state snapshots with the fold-every-commit ReplaySSM raw V, pre-norm K,
+  log-decay, and beta window.
 
 Both entries dispatch to one of:
 - ``gdn_wide_vec_kernel`` — the fast path (LDG.E.128 / STG.E.128). Covers
@@ -169,6 +172,11 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    cache_replayssm: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -211,6 +219,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     # h0_source[(cache_idx, i_hv, None, None)] uses cute's stride-aware addressing
     # and works correctly regardless of the per-slot stride. See PR #3268.
     cache_idx = h0_indices[i_n]
+    replayssm_slot = cache_idx
     if cutlass.const_expr(same_pool):
         # Single-pool: alias write to read; nvcc DCEs the write-side LDG /
         # IMAD / local_tile entirely in this compile path.
@@ -299,6 +308,23 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     )
                     cute.autovec_copy(k_tile_pre, r_k_bf16)
 
+                    # ReplaySSM persists only the raw recurrent inputs.  One
+                    # V-tile writes each (request, value-head), and one
+                    # representative value-head writes each shared K-head.
+                    # The pre-normalized BF16 K is intentional: commit applies
+                    # the same normalization before replaying the delta rule.
+                    if cutlass.const_expr(cache_replayssm):
+                        if replayssm_slot >= 0 and i_v == 0:
+                            if i_hv % (HV // H) == 0:
+                                for i in cutlass.range_constexpr(vec_size):
+                                    replayssm_rawk[
+                                        (replayssm_slot, i_h, i_t_pre, k_start + i)
+                                    ] = r_k_bf16[i]
+                            for i in cutlass.range_constexpr(vec_size):
+                                replayssm_rawv[
+                                    (replayssm_slot, i_hv, i_t_pre, k_start + i)
+                                ] = v[(i_n, i_t_pre, i_hv, k_start + i)]
+
                     if cutlass.const_expr(not disable_output):
                         for i in cutlass.range_constexpr(vec_size):
                             r_q[i] = cutlass.Float32(r_q_bf16[i])
@@ -371,6 +397,18 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         if lane_in_group == 0:
                             sGB[(i_t_pre, 0)] = r_g_pre
                             sGB[(i_t_pre, 1)] = r_beta_pre
+                        if cutlass.const_expr(cache_replayssm):
+                            if (
+                                replayssm_slot >= 0
+                                and i_v == 0
+                                and lane_in_group == 0
+                            ):
+                                replayssm_g[
+                                    (replayssm_slot, i_hv, i_t_pre)
+                                ] = r_g_value_pre
+                                replayssm_beta[
+                                    (replayssm_slot, i_hv, i_t_pre)
+                                ] = r_beta_pre
 
                 cute.arch.barrier()
 
@@ -894,6 +932,11 @@ def gdn_wide_vec_kernel(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    cache_replayssm: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -951,6 +994,7 @@ def gdn_wide_vec_kernel(
     # h0_source[(cache_idx, i_hv, None, None)] uses cute's stride-aware addressing
     # and works correctly regardless of the per-slot stride. See PR #3268.
     cache_idx = h0_indices[i_n]
+    replayssm_slot = cache_idx
 
     r_A_log = cutlass.Float32(A_log[i_hv])
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
@@ -1119,6 +1163,19 @@ def gdn_wide_vec_kernel(
                     k, (1, 1, 1, vec), (i_n, i_t_pre, i_h, member_pre)
                 )
                 cute.autovec_copy(k_tile_pre, r_k_bf16)
+
+                if cutlass.const_expr(cache_replayssm):
+                    if replayssm_slot >= 0 and i_v == 0:
+                        if i_hv % (HV // H) == 0:
+                            for i in cutlass.range_constexpr(vec):
+                                replayssm_rawk[
+                                    (replayssm_slot, i_h, i_t_pre, k_start_pre + i)
+                                ] = r_k_bf16[i]
+                        for i in cutlass.range_constexpr(vec):
+                            replayssm_rawv[
+                                (replayssm_slot, i_hv, i_t_pre, k_start_pre + i)
+                            ] = v[(i_n, i_t_pre, i_hv, k_start_pre + i)]
+
                 if cutlass.const_expr(do_q_pass):
                     for i in cutlass.range_constexpr(vec):
                         r_q[i] = cutlass.Float32(r_q_bf16[i])
@@ -1185,9 +1242,10 @@ def gdn_wide_vec_kernel(
                     use_softplus_pre * softplus_val_pre
                     + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
                 )
-                r_g_pre = cute.exp(
-                    -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
+                r_g_value_pre = (
+                    -cute.exp(r_A_log, fastmath=True) * softplus_x_pre
                 )
+                r_g_pre = cute.exp(r_g_value_pre, fastmath=True)
                 r_beta_pre = cutlass.Float32(1.0) / (
                     cutlass.Float32(1.0) + cute.exp(-r_b_pre, fastmath=True)
                 )
@@ -1195,6 +1253,14 @@ def gdn_wide_vec_kernel(
                 if lane_in_warp == 0:
                     sGB[(i_t_pre, 0)] = r_g_pre
                     sGB[(i_t_pre, 1)] = r_beta_pre
+                if cutlass.const_expr(cache_replayssm):
+                    if replayssm_slot >= 0 and i_v == 0 and lane_in_warp == 0:
+                        replayssm_g[
+                            (replayssm_slot, i_hv, i_t_pre)
+                        ] = r_g_value_pre
+                        replayssm_beta[
+                            (replayssm_slot, i_hv, i_t_pre)
+                        ] = r_beta_pre
 
             cute.arch.barrier()
 
@@ -2456,6 +2522,11 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    cache_replayssm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -2512,6 +2583,11 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+        cache_replayssm,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -2560,6 +2636,11 @@ def _run_wide_vec(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    cache_replayssm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     # B derived dynamically from q (mark_compact_shape_dynamic on dim 0) so the
@@ -2608,6 +2689,11 @@ def _run_wide_vec(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+        cache_replayssm,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -2857,6 +2943,71 @@ def _dtype_key(
     )
 
 
+def _resolve_replayssm_buffers(
+    *,
+    cache_replayssm: bool,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    A_log: torch.Tensor,
+    pool_size: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    replayssm_rawv: Optional[torch.Tensor],
+    replayssm_rawk: Optional[torch.Tensor],
+    replayssm_g: Optional[torch.Tensor],
+    replayssm_beta: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Validate ReplaySSM cache views or return allocation-free dummy args."""
+    buffers = (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+    if not cache_replayssm:
+        assert all(t is None for t in buffers), (
+            "replayssm_* buffers require cache_replayssm=True"
+        )
+        # These arguments are compile-time dead in the non-ReplaySSM
+        # specialization. Reuse existing tensors so the normal path retains
+        # its allocation-free launch behavior.
+        return v, k, A_log, A_log
+
+    assert all(t is not None for t in buffers), (
+        "cache_replayssm=True requires replayssm_rawv/rawk/g/beta"
+    )
+    assert T >= 3, f"ReplaySSM caching requires T >= 3, got T={T}"
+
+    assert replayssm_rawv is not None
+    assert replayssm_rawk is not None
+    assert replayssm_g is not None
+    assert replayssm_beta is not None
+    assert replayssm_rawv.shape == (pool_size, HV, T, V), (
+        "replayssm_rawv must have shape "
+        f"[{pool_size}, {HV}, {T}, {V}], got {tuple(replayssm_rawv.shape)}"
+    )
+    assert replayssm_rawk.shape == (pool_size, H, T, K), (
+        "replayssm_rawk must have shape "
+        f"[{pool_size}, {H}, {T}, {K}], got {tuple(replayssm_rawk.shape)}"
+    )
+    assert replayssm_g.shape == (pool_size, HV, T), (
+        "replayssm_g must have shape "
+        f"[{pool_size}, {HV}, {T}], got {tuple(replayssm_g.shape)}"
+    )
+    assert replayssm_beta.shape == (pool_size, HV, T), (
+        "replayssm_beta must have shape "
+        f"[{pool_size}, {HV}, {T}], got {tuple(replayssm_beta.shape)}"
+    )
+    assert replayssm_rawv.dtype == torch.bfloat16
+    assert replayssm_rawk.dtype == torch.bfloat16
+    assert replayssm_g.dtype == torch.float32
+    assert replayssm_beta.dtype == torch.float32
+    assert all(t.device == q.device for t in buffers if t is not None)
+    assert all(t.is_contiguous() for t in buffers if t is not None), (
+        "ReplaySSM cache buffers must be contiguous per-layer views"
+    )
+    return replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta
+
+
 def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
     """Select optimal tile_v for the MTP BF16 kernel based on batch size and T.
 
@@ -2963,6 +3114,11 @@ def gated_delta_rule_mtp_wide_vec(
     tile_v: int = 128,
     disable_output: bool = False,
     recovery_steps: int = 0,
+    cache_replayssm: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Wide-vector BF16 GDN MTP decode.
 
@@ -3003,6 +3159,38 @@ def gated_delta_rule_mtp_wide_vec(
         f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
     )
 
+    if cache_replayssm:
+        assert disable_state_update, (
+            "ReplaySSM verify must leave the checkpoint frozen "
+            "(disable_state_update=True)"
+        )
+        assert intermediate_states_buffer is None, (
+            "ReplaySSM replaces full intermediate-state snapshots"
+        )
+        assert accepted_steps is None and ssm_state_indices is None
+        assert recovery_steps == 0
+    (
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+    ) = _resolve_replayssm_buffers(
+        cache_replayssm=cache_replayssm,
+        q=q,
+        k=k,
+        v=v,
+        A_log=A_log,
+        pool_size=pool_size,
+        T=T_val,
+        H=H_val,
+        HV=HV_val,
+        K=K_val,
+        V=V_val,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+    )
     if scale is None:
         scale = 1.0 / math.sqrt(K_val)
 
@@ -3173,6 +3361,7 @@ def gated_delta_rule_mtp_wide_vec(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        cache_replayssm,
         _dtype_key(A_log, dt_bias, initial_state_indices),
     )
 
@@ -3223,6 +3412,16 @@ def gated_delta_rule_mtp_wide_vec(
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices
         )
+        if cache_replayssm:
+            rawv_ = _mark_slot_dynamic(replayssm_rawv)
+            rawk_ = _mark_slot_dynamic(replayssm_rawk)
+            replayssm_g_ = _mark_slot_dynamic(replayssm_g)
+            replayssm_beta_ = _mark_slot_dynamic(replayssm_beta)
+        else:
+            rawv_ = v_
+            rawk_ = k_
+            replayssm_g_ = A_log_
+            replayssm_beta_ = A_log_
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -3260,6 +3459,11 @@ def gated_delta_rule_mtp_wide_vec(
                 per_request_accepted_steps,
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
+                rawv_,
+                rawk_,
+                replayssm_g_,
+                replayssm_beta_,
+                cache_replayssm,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -3315,6 +3519,10 @@ def gated_delta_rule_mtp_wide_vec(
         output_state_indices,
         accepted_steps_arg,
         ssm_state_indices_arg,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
         stream,
     )
     return output
@@ -3590,6 +3798,11 @@ def gated_delta_rule_mtp(
     output: Optional[torch.Tensor] = None,
     disable_output: bool = False,
     recovery_steps: int = 0,
+    cache_replayssm: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     GDN MTP (Multiple Token Processing) with BF16 state.
@@ -3616,6 +3829,14 @@ def gated_delta_rule_mtp(
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
+        cache_replayssm: Write the fold-every-commit ReplaySSM raw window instead
+            of full intermediate-state snapshots. Requires frozen-state verify
+            mode (``disable_state_update=True``) and all four ``replayssm_*``
+            buffers.
+        replayssm_rawv: [pool_size, HV, T, V] bf16 raw V window.
+        replayssm_rawk: [pool_size, H, T, K] bf16 pre-normalization K window.
+        replayssm_g: [pool_size, HV, T] fp32 log-decay window.
+        replayssm_beta: [pool_size, HV, T] fp32 sigmoid-beta window.
 
     Returns:
         output: [B, T, HV, V] bf16
@@ -3774,12 +3995,49 @@ def gated_delta_rule_mtp(
             tile_v=wv_tile_v,
             disable_output=disable_output,
             recovery_steps=recovery_steps,
+            cache_replayssm=cache_replayssm,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
         )
 
     # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch
     # redirected here). Falls to the ILP=4 MTP path
     # (mtp_ilp4_kernel), which natively supports both single- and
     # split-pool, so the config picker is independent of pool mode.
+    if cache_replayssm:
+        assert disable_state_update, (
+            "ReplaySSM verify must leave the checkpoint frozen "
+            "(disable_state_update=True)"
+        )
+        assert intermediate_states_buffer is None, (
+            "ReplaySSM replaces full intermediate-state snapshots"
+        )
+        assert accepted_steps is None and ssm_state_indices is None
+        assert recovery_steps == 0
+    (
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+    ) = _resolve_replayssm_buffers(
+        cache_replayssm=cache_replayssm,
+        q=q,
+        k=k,
+        v=v,
+        A_log=A_log,
+        pool_size=pool_size,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+    )
     tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -3833,6 +4091,7 @@ def gated_delta_rule_mtp(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        cache_replayssm,
         _dtype_key(A_log, dt_bias, initial_state_indices),
     )
 
@@ -3883,6 +4142,16 @@ def gated_delta_rule_mtp(
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices
         )
+        if cache_replayssm:
+            rawv_ = _mark_slot_dynamic(replayssm_rawv)
+            rawk_ = _mark_slot_dynamic(replayssm_rawk)
+            replayssm_g_ = _mark_slot_dynamic(replayssm_g)
+            replayssm_beta_ = _mark_slot_dynamic(replayssm_beta)
+        else:
+            rawv_ = v_
+            rawk_ = k_
+            replayssm_g_ = A_log_
+            replayssm_beta_ = A_log_
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -3919,6 +4188,11 @@ def gated_delta_rule_mtp(
                 per_request_accepted_steps,
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
+                rawv_,
+                rawk_,
+                replayssm_g_,
+                replayssm_beta_,
+                cache_replayssm,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -3968,6 +4242,10 @@ def gated_delta_rule_mtp(
         output_state_indices,
         accepted_steps_arg,
         ssm_state_indices_arg,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
         stream,
     )
 

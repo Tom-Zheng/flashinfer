@@ -1303,6 +1303,87 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
         gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "batch_size,seq_len",
+    [(1, 4), (16, 4), (8, 8)],
+    ids=["inline", "warp_t4_tuned", "warp_t8"],
+)
+def test_gdn_decode_fp32_state_replayssm_cache(
+    batch_size: int,
+    seq_len: int,
+):
+    """FP32-state ReplaySSM writes raw fold inputs from a frozen verify."""
+    _skip_if_not_sm90_or_later()
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    H, HV, D = 8, 32, 128
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, seq_len, H, D, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn(batch_size, seq_len, HV, D, dtype=torch.bfloat16)
+        a = torch.randn(batch_size, seq_len, HV, dtype=torch.bfloat16) * 0.5
+        b_t = torch.randn_like(a)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.3
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+        state = torch.randn(batch_size, HV, D, D, dtype=torch.float32) * 0.1
+        state_before = state.clone()
+        indices = torch.arange(batch_size, dtype=torch.int32)
+        output_ref = torch.empty(
+            batch_size, seq_len, HV, D, dtype=torch.bfloat16
+        )
+        output_replayssm = torch.empty_like(output_ref)
+        rawv = torch.empty(batch_size, HV, seq_len, D, dtype=torch.bfloat16)
+        rawk = torch.empty(batch_size, H, seq_len, D, dtype=torch.bfloat16)
+        log_g = torch.empty(batch_size, HV, seq_len, dtype=torch.float32)
+        beta = torch.empty_like(log_g)
+
+    common = dict(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=state,
+        initial_state_indices=indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b_t,
+        scale=1.0 / math.sqrt(D),
+        disable_state_update=True,
+        use_qk_l2norm=True,
+    )
+    gated_delta_rule_mtp(**common, output=output_ref)
+    gated_delta_rule_mtp(
+        **common,
+        output=output_replayssm,
+        cache_replayssm=True,
+        replayssm_rawv=rawv,
+        replayssm_rawk=rawk,
+        replayssm_g=log_g,
+        replayssm_beta=beta,
+    )
+    torch.cuda.synchronize()
+
+    # Replay-specialized launch geometry may change FP32 accumulation order;
+    # require agreement well below one BF16 output ULP instead of bit identity.
+    torch.testing.assert_close(
+        output_replayssm, output_ref, atol=5e-5, rtol=1e-2
+    )
+    torch.testing.assert_close(state, state_before, atol=0, rtol=0)
+    torch.testing.assert_close(rawv, v.permute(0, 2, 1, 3), atol=0, rtol=0)
+    torch.testing.assert_close(rawk, k.permute(0, 2, 1, 3), atol=0, rtol=0)
+
+    x = a.float() + dt_bias.view(1, 1, HV)
+    expected_log_g = (
+        -A_log.exp().view(1, 1, HV) * torch.nn.functional.softplus(x)
+    ).permute(0, 2, 1)
+    expected_beta = torch.sigmoid(b_t.float()).permute(0, 2, 1)
+    torch.testing.assert_close(log_g, expected_log_g, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(beta, expected_beta, atol=2e-6, rtol=2e-6)
+
+
 # ============================================================================
 # Test MTP kernel with FP32 state, cache ON, state update ON (comprehensive)
 # This tests the full production configuration: all BS and T values
@@ -2359,6 +2440,81 @@ def test_gdn_decode_bf16_state_mtp_kernel(
         cache_intermediate_states,
         seed,
     )
+
+
+@pytest.mark.parametrize("batch_size,seq_len", [(1, 4), (8, 8)])
+def test_gdn_decode_bf16_state_replayssm_cache(
+    batch_size: int,
+    seq_len: int,
+):
+    """ReplaySSM writes only raw fold inputs without changing verify output."""
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    H, HV, D = 8, 32, 128
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, seq_len, H, D, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn(batch_size, seq_len, HV, D, dtype=torch.bfloat16)
+        a = torch.randn(batch_size, seq_len, HV, dtype=torch.bfloat16) * 0.5
+        b_t = torch.randn_like(a)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.3
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+        state = torch.randn(batch_size, HV, D, D, dtype=torch.bfloat16) * 0.1
+        state_before = state.clone()
+        indices = torch.arange(batch_size, dtype=torch.int32)
+        output_ref = torch.empty(
+            batch_size, seq_len, HV, D, dtype=torch.bfloat16
+        )
+        output_replayssm = torch.empty_like(output_ref)
+        rawv = torch.empty(batch_size, HV, seq_len, D, dtype=torch.bfloat16)
+        rawk = torch.empty(batch_size, H, seq_len, D, dtype=torch.bfloat16)
+        log_g = torch.empty(batch_size, HV, seq_len, dtype=torch.float32)
+        beta = torch.empty_like(log_g)
+
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=state,
+        initial_state_indices=indices,
+        disable_state_update=True,
+        use_qk_l2norm_in_kernel=True,
+        scale=1.0 / math.sqrt(D),
+    )
+    gdn_decode_bf16_state_mtp(**common, output=output_ref)
+    gdn_decode_bf16_state_mtp(
+        **common,
+        output=output_replayssm,
+        cache_replayssm=True,
+        replayssm_rawv=rawv,
+        replayssm_rawk=rawk,
+        replayssm_g=log_g,
+        replayssm_beta=beta,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output_replayssm, output_ref, atol=0, rtol=0)
+    torch.testing.assert_close(state, state_before, atol=0, rtol=0)
+    torch.testing.assert_close(rawv, v.permute(0, 2, 1, 3), atol=0, rtol=0)
+    torch.testing.assert_close(rawk, k.permute(0, 2, 1, 3), atol=0, rtol=0)
+
+    x = a.float() + dt_bias.view(1, 1, HV)
+    expected_log_g = (
+        -A_log.exp().view(1, 1, HV) * torch.nn.functional.softplus(x)
+    ).permute(0, 2, 1)
+    expected_beta = torch.sigmoid(b_t.float()).permute(0, 2, 1)
+    torch.testing.assert_close(log_g, expected_log_g, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(beta, expected_beta, atol=2e-6, rtol=2e-6)
 
 
 # ==============================================================================

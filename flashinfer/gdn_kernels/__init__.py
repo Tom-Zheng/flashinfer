@@ -9,12 +9,14 @@ provides high-performance CuTe DSL kernel implementations for specific use cases
 
 Exported Kernels:
 - gated_delta_rule: BF16 hidden state decode kernel (T=1)
-- gated_delta_rule_mtp: BF16 hidden state MTP kernel (T>=1)
+- gated_delta_rule_mtp: BF16 hidden state MTP kernel (T>=1), including the
+  fold-every-commit ReplaySSM raw-window specialization
 - gated_delta_rule_bf16state_cooprow: backward compat alias for gated_delta_rule
 - gated_delta_rule_bf16state_cooprow_mtp: backward compat alias for gated_delta_rule_mtp
 - run_pretranspose_decode: Pretranspose (V-major) decode kernel
 - run_nontranspose_decode: Nontranspose (K-major) decode kernel
 - run_mtp_decode: Multi-token processing decode kernel
+- commit_gdn_replayssm_fold_all_layers: all-layer ReplaySSM commit kernel
 - get_mtp_config, get_tile_v_mtp, get_vec_size_mtp: MTP hyperparameter helpers
 - gated_delta_rule_mtp_ucache: u/d-cache spec-decode verify kernel (ring append,
   read-only state; legacy 16-deep flat ring)
@@ -89,6 +91,11 @@ except (ImportError, RuntimeError):
     get_mtp_config = None  # type: ignore
 
 try:
+    from .gdn_replayssm_spec_fold import commit_gdn_replayssm_fold_all_layers
+except (ImportError, RuntimeError):
+    commit_gdn_replayssm_fold_all_layers = None  # type: ignore
+
+try:
     from .blackwell import chunk_gated_delta_rule_sm100, cp_delta_rule_dsl_sm100
 except (ImportError, RuntimeError):
     chunk_gated_delta_rule_sm100 = None  # type: ignore
@@ -118,6 +125,7 @@ __all__ = [
     "run_pretranspose_decode",
     "run_nontranspose_decode",
     "run_mtp_decode",
+    "commit_gdn_replayssm_fold_all_layers",
     "get_tile_v_mtp",
     "get_vec_size_mtp",
     "get_mtp_config",

@@ -651,6 +651,11 @@ def gated_delta_rule_mtp(
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,
+    cache_replayssm: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule MTP kernel (Multiple Token Processing).
 
@@ -729,6 +734,20 @@ def gated_delta_rule_mtp(
         to ``initial_state_indices`` (read and write target the same
         slot).  Negative entries skip the writeback for that batch
         (the read still runs).
+    cache_replayssm : bool
+        Persist only the fold-every-commit ReplaySSM raw input window instead
+        of full intermediate hidden-state snapshots. Requires frozen-state
+        verify mode (``disable_state_update=True``), no
+        ``intermediate_states_buffer`` or ``ssm_state_indices``, and all four
+        ``replayssm_*`` buffers. Default: ``False``.
+    replayssm_rawv : torch.Tensor, optional
+        BF16 raw V window of shape ``[pool_size, HV, T, V]``.
+    replayssm_rawk : torch.Tensor, optional
+        BF16 pre-normalization K window of shape ``[pool_size, H, T, K]``.
+    replayssm_g : torch.Tensor, optional
+        FP32 log-decay window of shape ``[pool_size, HV, T]``.
+    replayssm_beta : torch.Tensor, optional
+        FP32 sigmoid-beta window of shape ``[pool_size, HV, T]``.
 
     Returns
     -------
@@ -861,7 +880,11 @@ def gated_delta_rule_mtp(
         )
     else:
         cache_steps = T
-        intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
+        # This argument is compile-time dead when intermediate-state caching is
+        # disabled.  Reuse an existing tensor so the ReplaySSM tcgen fast path
+        # does not enqueue a tiny cudaMemset before every verify launch; the
+        # generic path replaces it with its shape-compatible cached dummy.
+        intermediate_states = initial_state
 
     # FLA-style per-token pool scatter. When provided, the kernel writes each
     # h_{t+1} directly to initial_state[ssm_state_indices[i, t]] instead of
@@ -888,6 +911,54 @@ def gated_delta_rule_mtp(
         )
         assert ssm_state_indices.device == q.device, (
             f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
+        )
+
+    replayssm_buffers = (
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+    )
+    if cache_replayssm:
+        assert disable_state_update, (
+            "ReplaySSM verify must leave the checkpoint frozen "
+            "(disable_state_update=True)"
+        )
+        assert intermediate_states_buffer is None, (
+            "ReplaySSM replaces full intermediate-state snapshots"
+        )
+        assert ssm_state_indices is None, (
+            "ReplaySSM and per-token state scatter are mutually exclusive"
+        )
+        assert T >= 3, f"ReplaySSM caching requires T >= 3, got T={T}"
+        assert all(t is not None for t in replayssm_buffers), (
+            "cache_replayssm=True requires replayssm_rawv/rawk/g/beta"
+        )
+        expected_replayssm = (
+            ((pool_size, HV, T, V), torch.bfloat16, "replayssm_rawv"),
+            ((pool_size, H, T, K), torch.bfloat16, "replayssm_rawk"),
+            ((pool_size, HV, T), torch.float32, "replayssm_g"),
+            ((pool_size, HV, T), torch.float32, "replayssm_beta"),
+        )
+        for tensor, (shape, dtype, name) in zip(
+            replayssm_buffers, expected_replayssm
+        ):
+            assert tensor is not None
+            assert tensor.shape == shape, (
+                f"{name} must have shape {list(shape)}, got {tuple(tensor.shape)}"
+            )
+            assert tensor.dtype == dtype, (
+                f"{name} must have dtype {dtype}, got {tensor.dtype}"
+            )
+            assert tensor.device == q.device, (
+                f"{name} device {tensor.device} != q device {q.device}"
+            )
+            assert tensor.is_contiguous(), (
+                f"{name} must be a contiguous per-layer ReplaySSM view"
+            )
+    else:
+        assert all(t is None for t in replayssm_buffers), (
+            "replayssm_* buffers require cache_replayssm=True"
         )
 
     # Execute kernel
@@ -920,6 +991,11 @@ def gated_delta_rule_mtp(
         ssm_state_indices=ssm_state_indices,
         output_state_indices=output_state_indices,
         use_pool_indexing=pool_use_pool_indexing,
+        cache_replayssm=cache_replayssm,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
     )
 
     # No post-kernel scatter step: the contiguity assert above guarantees
