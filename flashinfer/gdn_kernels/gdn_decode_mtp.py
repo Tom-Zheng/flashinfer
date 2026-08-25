@@ -38,6 +38,7 @@ and is dispatched via the public run_mtp_decode() function.
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -47,6 +48,28 @@ from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
 from .dtype_compat import as_bf16
+
+
+_REPLAYSSM_VERIFY_USE_TF32_ENV = "FLASHINFER_GDN_REPLAYSSM_VERIFY_USE_TF32"
+_ENV_TRUE_VALUES = frozenset(("1", "true", "yes", "on"))
+_ENV_FALSE_VALUES = frozenset(("", "0", "false", "no", "off", "none"))
+
+
+def _get_replayssm_verify_tf32_override() -> Optional[bool]:
+    """Read the ReplaySSM verify Tensor Core dispatch override at call time."""
+    raw_value = os.environ.get(_REPLAYSSM_VERIFY_USE_TF32_ENV)
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip().lower()
+    if value in _ENV_TRUE_VALUES:
+        return True
+    if value in _ENV_FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"{_REPLAYSSM_VERIFY_USE_TF32_ENV} must be one of "
+        f"{sorted(_ENV_TRUE_VALUES | _ENV_FALSE_VALUES)!r}, got {raw_value!r}"
+    )
 
 
 def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 16):
@@ -2906,6 +2929,10 @@ def run_mtp_decode(
             that batch slot (matching the read-side padding skip semantics).
         cache_replayssm: Whether to persist only the fold-every-commit
             ReplaySSM inputs instead of full intermediate states.
+
+    ``FLASHINFER_GDN_REPLAYSSM_VERIFY_USE_TF32`` overrides the automatic
+    ReplaySSM verify Tensor Core policy when set. True values force an eligible
+    TF32 specialization; false values force the generic FMA path.
     """
     # Kernel is bf16-only for q/k/v/a/b/output; stage non-bf16 caller output for writeback.
     q, k, v, a, b = as_bf16(q, k, v, a, b)
@@ -2943,18 +2970,79 @@ def run_mtp_decode(
     if cache_replayssm and T >= 8 and work_units == 256:
         vec_size = 8
     use_inline_kernel = (B * HV) <= 128
-    major, _ = torch.cuda.get_device_capability(q.device)
+    major, minor = torch.cuda.get_device_capability(q.device)
     use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
 
     per_token_pool_scatter = ssm_state_indices is not None
+    replayssm_tf32_override = (
+        _get_replayssm_verify_tf32_override() if cache_replayssm else None
+    )
+
+    # SM120 frozen-state ReplaySSM fast path.  SM120 cannot execute tcgen05,
+    # so use the Ampere-style TF32 warp MMA path. Without an environment
+    # override, only the profitable T=8, B>=8 region selects it automatically.
+    # An explicit true override admits every statically supported T and batch;
+    # an explicit false override disables the specialization.
+    replayssm_hmma_eligible = (
+        (major, minor) == (12, 0)
+        and cache_replayssm
+        and disable_state_update
+        and not cache_intermediate_states
+        and not per_token_pool_scatter
+        and not use_pool_indexing
+        and output_writeback is None
+        and h0_source.dtype == torch.float32
+        and initial_state_indices.dtype == torch.int32
+        and T in (4, 5, 6, 7, 8)
+        and K == 128
+        and V == 128
+        and 1 <= B <= 256
+        and use_qk_l2norm
+    )
+    if replayssm_tf32_override is None:
+        use_replayssm_hmma = replayssm_hmma_eligible and T == 8 and B >= 8
+    else:
+        use_replayssm_hmma = replayssm_hmma_eligible and replayssm_tf32_override
+    if use_replayssm_hmma:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+        from .gdn_decode_mtp_replayssm_hmma import (
+            run_gdn_verify_kernel_mtp_replayssm_hmma,
+        )
+
+        run_gdn_verify_kernel_mtp_replayssm_hmma(
+            h0_source,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices,
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            H,
+            HV,
+            scale,
+        )
+        return
 
     # B300/SM100 frozen-state ReplaySSM fast path.  One CTA owns two adjacent
     # (V=128, K=128) heads, shares their Q/K and Gram work, streams both FP32
     # checkpoints with TMA, and uses tcgen05 for every state/K and state/Q dot.
     # Keep the dispatch deliberately narrow until the remaining pool/scatter/
-    # update contracts are implemented by that specialization.
+    # update contracts are implemented by that specialization.  Unset/true
+    # retain the pre-SM120 policy; an explicit false override disables tcgen05.
     use_replayssm_tcgen = (
         major == 10
+        and replayssm_tf32_override is not False
         and cache_replayssm
         and disable_state_update
         and not cache_intermediate_states
