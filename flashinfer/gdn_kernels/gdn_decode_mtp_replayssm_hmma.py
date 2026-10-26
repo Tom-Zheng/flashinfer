@@ -61,6 +61,22 @@ def _to_tf32(fragment: cute.Tensor) -> cute.Tensor:
     return result
 
 
+@cute.jit
+def _operand_column(k_idx):
+    """Return the MMA K column that holds true K index ``k_idx``.
+
+    A dot product is invariant under a consistent permutation of K.  Within
+    each 64-wide K group, lane t loads true state columns [16t, 16t + 16) as
+    one contiguous run; element j of that run feeds column t + 4 * (j % 2) of
+    k-tile j // 2.  K/Q are stored at the same columns, so both the state
+    products and the K/Q Gram matrix are unchanged.
+    """
+    k_group = k_idx // 64
+    p = k_idx % 64
+    j = p % 16
+    return k_group * 64 + (j // 2) * 8 + p // 16 + 4 * (j % 2)
+
+
 @cute.kernel
 def gdn_verify_kernel_mtp_replayssm_hmma(
     state: cute.Tensor,
@@ -182,8 +198,11 @@ def gdn_verify_kernel_mtp_replayssm_hmma(
         k_norm = cute.rsqrt(sum_k + 1e-6, fastmath=True)
         for elem in cutlass.range_constexpr(4):
             k_idx = lane * 4 + elem
-            s_operand[(i_t, k_idx)] = k_reg[elem] * k_norm
-            s_operand[(T + i_t, k_idx)] = q_reg[elem] * q_norm
+            # Store K/Q at the MMA column whose state element the A loads below
+            # place there (see _operand_column).
+            k_col = _operand_column(k_idx)
+            s_operand[(i_t, k_col)] = k_reg[elem] * k_norm
+            s_operand[(T + i_t, k_col)] = q_reg[elem] * q_norm
             if valid and i_split == 0 and i_hv % heads_per_q == 0:
                 replayssm_rawk[(safe_cache_idx, i_h, i_t, k_idx)] = k_reg_bf16[
                     elem
@@ -227,6 +246,10 @@ def gdn_verify_kernel_mtp_replayssm_hmma(
         cute.make_layout((1, 1, 1)),
     )
     thr_mma = hmma.get_slice(lane)
+    # m16n8k8 TF32 operand coordinates: lane holds A rows g and g+8 and the
+    # K columns t and t+4 of each k-tile.
+    mma_row = lane // 4
+    mma_col = lane % 4
     copy_atom = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(), _ACC, num_bits_per_copy=32
     )
@@ -267,11 +290,26 @@ def gdn_verify_kernel_mtp_replayssm_hmma(
                 )
                 b1_tf32 = _to_tf32(b1_f32)
 
+            # Each lane reads 16 contiguous state columns from rows g and g+8
+            # with 128-bit loads instead of the MMA layout's scattered 32-bit
+            # elements; _operand_column permutes K/Q to match.
             state_a = cute.local_tile(state_matrix, (16, 64), (row_tile, k_group))
             a_f32 = cute.make_rmem_tensor_like(
                 hmma.make_fragment_A(thr_mma.partition_A(state_a)), _ACC
             )
-            cute.copy(copy_a, thr_a.partition_S(state_a), thr_a.retile(a_f32))
+            for row_half in cutlass.range_constexpr(2):
+                a_row = cute.make_rmem_tensor(cute.make_layout((1, 16)), _ACC)
+                cute.autovec_copy(
+                    cute.local_tile(
+                        state_matrix,
+                        (1, 16),
+                        (row_tile * 16 + row_half * 8 + mma_row, k_group * 4 + mma_col),
+                    ),
+                    a_row,
+                )
+                for j in cutlass.range_constexpr(16):
+                    # Fragment index: row half + 2 * column half + 4 * k-tile.
+                    a_f32[row_half + 2 * (j % 2) + 4 * (j // 2)] = a_row[(0, j)]
             a_tf32 = _to_tf32(a_f32)
             for k_tile in cutlass.range_constexpr(8):
                 cute.gemm(
