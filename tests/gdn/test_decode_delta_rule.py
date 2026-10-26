@@ -1303,21 +1303,23 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
         gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
 
 
+@pytest.mark.parametrize("num_v_heads", [32, 24])
 @pytest.mark.parametrize(
     "batch_size,seq_len",
-    [(1, 4), (16, 4), (8, 8)],
-    ids=["inline", "warp_t4_tuned", "warp_t8"],
+    [(1, 4), (16, 4), (1, 8), (8, 8)],
+    ids=["inline", "warp_t4_tuned", "inline_t8", "warp_t8"],
 )
 def test_gdn_decode_fp32_state_replayssm_cache(
     batch_size: int,
     seq_len: int,
+    num_v_heads: int,
 ):
     """FP32-state ReplaySSM writes raw fold inputs from a frozen verify."""
     _skip_if_not_sm90_or_later()
 
     torch.random.manual_seed(0)
     torch.cuda.manual_seed(0)
-    H, HV, D = 8, 32, 128
+    H, HV, D = 8, num_v_heads, 128
     device = torch.device("cuda")
 
     with device:

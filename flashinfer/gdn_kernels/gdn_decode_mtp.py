@@ -2980,9 +2980,10 @@ def run_mtp_decode(
 
     # SM120 frozen-state ReplaySSM fast path.  SM120 cannot execute tcgen05,
     # so use the Ampere-style TF32 warp MMA path. Without an environment
-    # override, only the profitable T=8, B>=8 region selects it automatically.
-    # An explicit true override admits every statically supported T and batch;
-    # an explicit false override disables the specialization.
+    # override, only T=8 selects it automatically; at T=4 the FMA path is as
+    # fast or faster except at B=1. An explicit true override admits every
+    # statically supported T and batch; an explicit false override disables
+    # the specialization.
     replayssm_hmma_eligible = (
         (major, minor) == (12, 0)
         and cache_replayssm
@@ -3000,7 +3001,7 @@ def run_mtp_decode(
         and use_qk_l2norm
     )
     if replayssm_tf32_override is None:
-        use_replayssm_hmma = replayssm_hmma_eligible and T == 8 and B >= 8
+        use_replayssm_hmma = replayssm_hmma_eligible and T == 8
     else:
         use_replayssm_hmma = replayssm_hmma_eligible and replayssm_tf32_override
     if use_replayssm_hmma:
@@ -3031,6 +3032,9 @@ def run_mtp_decode(
             H,
             HV,
             scale,
+            # Split each head's V rows across CTAs so enough state loads are in
+            # flight: four ways when there are few heads, two otherwise.
+            v_split=4 if work_units <= 128 else 2,
         )
         return
 
