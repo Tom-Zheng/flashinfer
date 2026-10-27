@@ -1306,8 +1306,8 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
 @pytest.mark.parametrize("num_v_heads", [32, 24])
 @pytest.mark.parametrize(
     "batch_size,seq_len",
-    [(1, 4), (16, 4), (1, 8), (8, 8)],
-    ids=["inline", "warp_t4_tuned", "inline_t8", "warp_t8"],
+    [(1, 4), (16, 4), (1, 6), (8, 7), (1, 8), (8, 8)],
+    ids=["inline", "warp_t4_tuned", "inline_t6", "warp_t7", "inline_t8", "warp_t8"],
 )
 def test_gdn_decode_fp32_state_replayssm_cache(
     batch_size: int,
