@@ -44,13 +44,14 @@ and run the two halves back to back on the current stream.
 
     ugpu_state_pool
 
-ReplaySSM speculative verification (SM100/SM103, SM120)
--------------------------------------------------------
+ReplaySSM speculative verification (SM90, SM100/SM103, SM120)
+-------------------------------------------------------------
 
 Use ``gated_delta_rule_mtp(cache_replayssm=True, disable_state_update=True)``
-with FP32 128x128 checkpoints. For each layer, pass contiguous views into
-all-layer BF16 raw K/V windows and FP32 log-decay/beta windows. The windows are
-indexed by the same pool slots as the checkpoints. Verify produces outputs
+with FP32 DxD checkpoints (D=128 on SM100/SM103 and SM120, D=64 on SM90). For
+each layer, pass contiguous views into all-layer BF16 raw K/V windows and FP32
+log-decay/beta windows. The windows are indexed by the same pool slots as the
+checkpoints. Verify produces outputs
 without changing the checkpoint or storing a full state for every token.
 
 Once the accepted lengths are known, call ``gated_delta_rule_replayssm_commit``
@@ -74,6 +75,14 @@ index uniqueness, padding and optional tracked-checkpoint contracts.
   MMA and splits each head's value rows across several CTAs. It is selected
   when ``B * HV <= 128`` or T>=7, where it is generally faster than the FP32
   fallback; larger batches at T<=6 keep the fallback.
+- SM90 verifies FP32 64x64 checkpoints (K=V=64) with a single persistent
+  kernel and no fallback: TMA streams the checkpoints, a TF32 ``wgmma`` per
+  value head forms the checkpoint products, and the raw windows and output
+  are written with TMA stores. It requires T<=16, HV divisible by 8,
+  normalized Q/K and TMA-compatible activations (unit inner stride, 16-byte
+  aligned outer strides); other inputs are rejected. SM90 provides verify
+  only: ``gated_delta_rule_replayssm_commit`` and u mode require K=V=128 and
+  SM100/SM103 or SM120.
 
 Commit defaults to ``backend="auto"``. On SM100/SM103, with normalized K and
 no tracking, T=8..16 uses tcgen05; T=6/7 uses tcgen05 when B>1 and

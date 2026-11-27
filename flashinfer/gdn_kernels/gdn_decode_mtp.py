@@ -3182,6 +3182,41 @@ def run_mtp_decode(
         # Keep padding rows (negative indices); do not use empty scratch.
         output = output_writeback.to(torch.bfloat16)
 
+    # SM90 frozen-state ReplaySSM verify (K = V = 64).  The caller validated
+    # its contract (check_sm90_replayssm_verify); it is the only SM90 path.
+    if cache_replayssm and gdn_device_target(q.device).major == 9:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+        from .gdn_decode_mtp_replayssm_sm90 import (
+            run_gdn_verify_kernel_mtp_replayssm_sm90,
+        )
+
+        run_gdn_verify_kernel_mtp_replayssm_sm90(
+            h0_source,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices.to(torch.int32),
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            H,
+            HV,
+            scale,
+        )
+        if output_writeback is not None:
+            output_writeback.copy_(output)
+        return
+
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     tile_v, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128

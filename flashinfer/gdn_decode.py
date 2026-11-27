@@ -1493,7 +1493,8 @@ def gated_delta_rule_mtp(
         slot).  Negative entries skip the writeback for that batch
         (the read still runs).
     cache_replayssm : bool
-        SM100/SM103 and SM120 only, FP32 checkpoint, K=V=128, T>=3.
+        SM100/SM103 and SM120 with K=V=128, or SM90 with K=V=64 (see below);
+        FP32 checkpoint, T>=3.
         Persist only the fold-every-commit ReplaySSM raw input window instead
         of full intermediate hidden-state snapshots. Requires frozen-state
         verify mode (``disable_state_update=True``), no
@@ -1516,6 +1517,12 @@ def gated_delta_rule_mtp(
         ``B * HV <= 128`` or T>=7. Other supported cases use the FP32 MTP
         fallback. TF32 changes reduction precision; outputs need not be
         bitwise equal to the fallback.
+
+        SM90 serves ReplaySSM verify with one TMA/wgmma TF32 kernel and no
+        fallback; it requires K=V=64, T<=16, HV divisible by 8, normalized
+        Q/K, a contiguous checkpoint pool, and Q/K/V/a/b/output with a unit
+        inner stride and 16-byte aligned outer strides. It writes the raw
+        V/beta windows only (no ``replayssm_u`` or ``verify_parents``).
     replayssm_rawv : torch.Tensor, optional
         BF16 raw V window of shape ``[pool_size, HV, T, V]``.
     replayssm_rawk : torch.Tensor, optional
@@ -1551,8 +1558,8 @@ def gated_delta_rule_mtp(
 
     Notes
     -----
-    - Standard MTP requires SM90 or later; ReplaySSM requires SM100/SM103
-      or SM120.
+    - Standard MTP requires SM90 or later; ReplaySSM requires SM90 (K=V=64),
+      SM100/SM103 or SM120 (K=V=128).
     - Supports ``T > 1`` (multiple token processing).
     - State layout is K-last: ``[pool_size, HV, V, K]``.
     - Optimized for speculative decoding verification scenarios.
@@ -1572,9 +1579,17 @@ def gated_delta_rule_mtp(
     _, _, HV, V = v.shape
     pool_size = initial_state.shape[0]
 
+    # SM90 serves ReplaySSM verify with a dedicated kernel (K = V = 64) whose
+    # contract is checked below; the generic MTP tiling limits do not apply.
+    sm90_replayssm = False
+    if cache_replayssm:
+        from .gdn_kernels.device_target import gdn_device_target
+
+        sm90_replayssm = gdn_device_target(q.device).major == 9
+
     # Dynamic TILE_V and vec_size selection based on batch size and sequence length
-    tile_v = get_tile_v_mtp(B, T, num_v_heads=HV, v_dim=V)
-    vec_size = get_vec_size_mtp(B, T)
+    tile_v = 0 if sm90_replayssm else get_tile_v_mtp(B, T, num_v_heads=HV, v_dim=V)
+    vec_size = 0 if sm90_replayssm else get_vec_size_mtp(B, T)
 
     # Validate state shape
     assert initial_state.shape == (pool_size, HV, V, K), (
@@ -1582,11 +1597,12 @@ def gated_delta_rule_mtp(
     )
 
     # Validate K and V constraints
-    assert K >= 128, f"K must be at least 128, got K={K}"
-    assert V >= 128, f"V must be at least 128, got V={V}"
-    assert V % tile_v == 0, (
-        f"V must be divisible by {tile_v} to prevent out-of-bounds access, got V={V}"
-    )
+    if not sm90_replayssm:
+        assert K >= 128, f"K must be at least 128, got K={K}"
+        assert V >= 128, f"V must be at least 128, got V={V}"
+        assert V % tile_v == 0, (
+            f"V must be divisible by {tile_v} to prevent out-of-bounds access, got V={V}"
+        )
 
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
@@ -1741,8 +1757,8 @@ def gated_delta_rule_mtp(
         from .gdn_kernels.device_target import gdn_device_target
 
         target = gdn_device_target(q.device)
-        if target.major != 10 and (target.major, target.minor) != (12, 0):
-            raise ValueError("ReplaySSM caching requires SM100/SM103 or SM120")
+        if target.major not in (9, 10) and (target.major, target.minor) != (12, 0):
+            raise ValueError("ReplaySSM caching requires SM90, SM100/SM103 or SM120")
         # A raise, not an assert: -O must not let verify mutate the frozen checkpoint.
         if not disable_state_update:
             raise ValueError(
@@ -1778,7 +1794,19 @@ def gated_delta_rule_mtp(
             )
         ):
             raise ValueError("ReplaySSM tensors must be on the query device")
-        if not (K == V == 128):
+        if sm90_replayssm:
+            from .gdn_kernels.gdn_decode_mtp_replayssm_sm90 import (
+                check_sm90_replayssm_verify,
+            )
+
+            check_sm90_replayssm_verify(q, k, v, a, b, initial_state, output, T, H, HV)
+            if not use_qk_l2norm:
+                raise ValueError("SM90 ReplaySSM verify requires use_qk_l2norm=True")
+            if verify_parents is not None:
+                raise ValueError(
+                    "SM90 ReplaySSM verify does not support verify_parents"
+                )
+        elif not (K == V == 128):
             raise ValueError("ReplaySSM requires K=V=128")
         if H <= 0 or HV <= 0 or HV % H != 0:
             raise ValueError("ReplaySSM requires HV divisible by H")
