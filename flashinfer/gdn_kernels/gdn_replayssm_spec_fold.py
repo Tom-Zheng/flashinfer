@@ -36,6 +36,11 @@ from .gdn_replayssm_u_commit import (
     MAX_WINDOW as U_MAX_WINDOW,
     commit_gdn_replayssm_u_all_layers,
 )
+from .gdn_replayssm_commit_sm90 import (
+    MAX_WINDOW as _SM90_MAX_WINDOW,
+    HEAD_DIM as _SM90_D,
+    run_gdn_replayssm_commit_sm90,
+)
 import cuda.bindings.driver as cuda
 
 
@@ -461,11 +466,12 @@ def commit_gdn_replayssm_fold_all_layers(
 ) -> None:
     """Replay the accepted prefix into every layer's FP32 checkpoint.
 
-    Checkpoints have shape ``[layers, slots, HV, 128, 128]`` (FP32, K-last).
-    Raw K/V windows have shape ``[layers, slots, H/HV, T, 128]`` (BF16);
+    Checkpoints have shape ``[layers, slots, HV, D, D]`` (FP32, K-last), with
+    D=128 on SM100/SM103 or SM120 and D=64 on SM90.
+    Raw K/V windows have shape ``[layers, slots, H/HV, T, D]`` (BF16);
     log-decay and beta have shape ``[layers, slots, HV, T]`` (FP32).
-    All tensors must be contiguous and on the same SM100/SM103 or SM120 CUDA
-    device.
+    All tensors must be contiguous and on the same CUDA device.  SM90 runs
+    ``gdn_replayssm_commit_sm90`` (normalized keys, T <= 16, no paths or u).
 
     ``ssm_state_indices`` and ``accept_lens`` are int32 vectors of length B.
     Each live slot must be unique and in range; accepted lengths must lie in
@@ -497,8 +503,9 @@ def commit_gdn_replayssm_fold_all_layers(
         raise ValueError("checkpoint_state must be [layers, slots, HV, V, K]")
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     target = gdn_device_target(checkpoint_state.device)
-    if target.major != 10 and (target.major, target.minor) != (12, 0):
-        raise ValueError("ReplaySSM commit requires SM100/SM103 or SM120")
+    sm90 = target.major == 9
+    if not sm90 and target.major != 10 and (target.major, target.minor) != (12, 0):
+        raise ValueError("ReplaySSM commit requires SM90, SM100/SM103 or SM120")
     if num_layers < 1 or num_slots < 1 or max_cache_len < 1:
         raise ValueError("layers, slots, and max_cache_len must be positive")
     H = int(num_k_heads)
@@ -510,13 +517,33 @@ def commit_gdn_replayssm_fold_all_layers(
     has_track = track_state_indices is not None or track_steps is not None
     if has_track and (track_state_indices is None or track_steps is None):
         raise ValueError("track_state_indices and track_steps are paired")
-    if (K, V) != (_K, _V):
-        raise ValueError(f"CuTe ReplaySSM fold requires K=V=128, got K={K}, V={V}")
+    head_dim = _SM90_D if sm90 else _K
+    if (head_dim, head_dim) != (K, V):
+        raise ValueError(
+            f"CuTe ReplaySSM fold requires K=V={head_dim} on this architecture, "
+            f"got K={K}, V={V}"
+        )
     if H <= 0 or HV <= 0 or HV % H != 0:
         raise ValueError(f"HV={HV} must be divisible by H={H}")
     warps_per_cta = 4
     if backend not in ("auto", "simt", "tcgen05"):
         raise ValueError("backend must be auto, simt, or tcgen05")
+    if sm90:
+        # SM90 has one commit kernel (TF32 wgmma) for the verify contract:
+        # normalized keys, T <= 16, contiguous accepted prefixes, raw windows.
+        if u_cache is not None:
+            raise ValueError("u_cache commit requires SM100/SM103")
+        if backend != "auto":
+            raise ValueError("SM90 ReplaySSM commit supports only backend='auto'")
+        if accept_paths is not None:
+            raise ValueError("SM90 ReplaySSM commit does not support accept_paths")
+        if not use_qk_l2norm_in_kernel:
+            raise ValueError("SM90 ReplaySSM commit requires use_qk_l2norm=True")
+        if max_cache_len > _SM90_MAX_WINDOW:
+            raise ValueError(
+                f"SM90 ReplaySSM commit supports T <= {_SM90_MAX_WINDOW}, "
+                f"got {max_cache_len}"
+            )
     u_mode = u_cache is not None
     window: tuple[tuple[torch.Tensor | None, tuple[int, ...], torch.dtype, str], ...]
     if u_mode:
@@ -659,6 +686,22 @@ def commit_gdn_replayssm_fold_all_layers(
         )
         return
 
+    if sm90:
+        if B == 0:
+            return
+        run_gdn_replayssm_commit_sm90(
+            checkpoint_state,
+            rawv_cache,
+            rawk_cache,
+            g_cache,
+            beta_cache,
+            ssm_state_indices,
+            accept_lens,
+            track_state_indices if has_track else None,
+            track_steps if has_track else None,
+            null_block_id,
+        )
+        return
     if backend == "tcgen05" and target.major != 10:
         raise ValueError("tcgen05 commit requires SM100/SM103")
     supports_tcgen = (

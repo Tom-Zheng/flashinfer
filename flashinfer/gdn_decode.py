@@ -1522,7 +1522,8 @@ def gated_delta_rule_mtp(
         fallback; it requires K=V=64, T<=16, HV divisible by 8, normalized
         Q/K, a contiguous checkpoint pool, and Q/K/V/a/b/output with a unit
         inner stride and 16-byte aligned outer strides. It writes the raw
-        V/beta windows only (no ``replayssm_u`` or ``verify_parents``).
+        V/beta windows only (no ``replayssm_u`` or ``verify_parents``); commit
+        them with :func:`gated_delta_rule_replayssm_commit` on SM90.
     replayssm_rawv : torch.Tensor, optional
         BF16 raw V window of shape ``[pool_size, HV, T, V]``.
     replayssm_rawk : torch.Tensor, optional
@@ -1998,14 +1999,14 @@ def gated_delta_rule_replayssm_commit(
     Parameters
     ----------
     checkpoint_state : torch.Tensor
-        Contiguous FP32 ``[layers, slots, HV, 128, 128]`` state, K-last.
-        Updated in place. All tensors must be on the same SM100/SM103 or
-        SM120 device.
+        Contiguous FP32 ``[layers, slots, HV, D, D]`` state, K-last, with
+        D=128 on SM100/SM103 or SM120 and D=64 on SM90. Updated in place. All
+        tensors must be on the same device.
     rawv_cache : torch.Tensor or None
-        Contiguous BF16 ``[layers, slots, HV, T, 128]`` raw V windows.
+        Contiguous BF16 ``[layers, slots, HV, T, D]`` raw V windows.
         Must be None with ``u_cache``.
     rawk_cache : torch.Tensor
-        Contiguous BF16 ``[layers, slots, H, T, 128]`` pre-normalization K.
+        Contiguous BF16 ``[layers, slots, H, T, D]`` pre-normalization K.
     g_cache : torch.Tensor
         Contiguous FP32 ``[layers, slots, HV, T]`` log-decay windows.
     beta_cache : torch.Tensor or None
@@ -2051,6 +2052,10 @@ def gated_delta_rule_replayssm_commit(
         snapshots from the untouched checkpoint, so the snapshot is FP32 while
         the live slot is TF32 and the two can differ by about 1e-5. Use ``simt``
         to retain FP32 contractions. Must be ``auto`` with ``u_cache``.
+        Must be ``auto`` on SM90, which has one TF32 commit kernel for the
+        SM90 verify windows (K=V=64, T<=16, normalized K, no ``accept_paths``
+        or ``u_cache``); it supports tracking and is tested to the tcgen05
+        commit's tolerance (atol 1e-4, rtol 1e-3 against an FP64 replay).
     u_cache : torch.Tensor, optional
         Contiguous FP32 ``[layers, slots, HV, T, 128]`` windows written by
         :func:`gated_delta_rule_mtp` through ``replayssm_u`` (SM100/SM103,

@@ -80,9 +80,8 @@ index uniqueness, padding and optional tracked-checkpoint contracts.
   value head forms the checkpoint products, and the raw windows and output
   are written with TMA stores. It requires T<=16, HV divisible by 8,
   normalized Q/K and TMA-compatible activations (unit inner stride, 16-byte
-  aligned outer strides); other inputs are rejected. SM90 provides verify
-  only: ``gated_delta_rule_replayssm_commit`` and u mode require K=V=128 and
-  SM100/SM103 or SM120.
+  aligned outer strides); other inputs are rejected. SM90 writes the raw
+  V/beta windows only (no u mode, no ``verify_parents``).
 
 Commit defaults to ``backend="auto"``. On SM100/SM103, with normalized K and
 no tracking, T=8..16 uses tcgen05; T=6/7 uses tcgen05 when B>1 and
@@ -94,6 +93,17 @@ may favor ``backend="simt"``. SIMT also retains FP32 contractions when
 checkpoint accuracy is preferred over tensor-core throughput. On SM120, commit
 always uses the FP32 SIMT kernel: ``auto`` resolves to ``simt`` and explicit
 ``backend="tcgen05"`` is rejected.
+
+On SM90, commit takes the K=V=64 windows written by SM90 verify (T<=16,
+normalized keys, contiguous accepted prefixes, raw V/beta windows; no
+``accept_paths`` or ``u_cache``) and runs one persistent kernel, so only
+``backend="auto"`` is accepted. TMA streams each checkpoint once, TF32
+tensor cores form the checkpoint product and the rank-``a`` update from a
+closed-form solve of the accepted prefix, and the result leaves with a TMA
+store. The checkpoint itself enters the result in FP32, and the correction
+terms use raw BF16 keys and two-term TF32 splits; the result is tested to the
+tcgen05 commit's tolerance (atol 1e-4, rtol 1e-3 against an FP64 replay).
+Tracked snapshots are supported.
 
 u mode (SM100/SM103, T<=32): pass an FP32 ``replayssm_u`` window instead of
 the raw V and beta windows. Verify then stores the delta-rule corrections
